@@ -28,43 +28,53 @@ def get_stock_data(ticker_symbol="SPY", period="1y"):
 
 
 def get_options_data(stock):
-    expiration_dates = stock.options
-    calls_dict = {date: stock.option_chain(date).calls for date in expiration_dates}
+    calls_frames = []
+    for date in stock.options:
+        try:
+            chain = stock.option_chain(date).calls.copy()
+            chain["expiration"] = date
+            calls_frames.append(chain)
+        except Exception:
+            continue
 
-    for date, df in calls_dict.items():
-        df['expiration'] = date
-
-    calls_all = pd.concat(calls_dict.values())
-    return calls_all, expiration_dates
+    calls_all = pd.concat(calls_frames, ignore_index=True) if calls_frames else pd.DataFrame()
+    return calls_all, stock.options
 
 def filter_calls_data(calls_data, spot_price, min_strike_price, max_strike_price):
-    filtered_calls_data = calls_data[(calls_data['strike'] >= min_strike_price) & (calls_data['strike'] <= max_strike_price)]
-    filtered_calls_data = filtered_calls_data[filtered_calls_data['expiration'].apply(f.calculate_time_to_expiration) >= 0.07]
+    filtered_calls_data = calls_data[
+        (calls_data["strike"] >= min_strike_price) &
+        (calls_data["strike"] <= max_strike_price)].copy()
+
+    filtered_calls_data["TimeToExpiry"] = filtered_calls_data["expiration"].map(f.calculate_time_to_expiration)
+    filtered_calls_data = filtered_calls_data[filtered_calls_data["TimeToExpiry"] >= 0.07]
+
+    bid = filtered_calls_data["bid"]
+    ask = filtered_calls_data["ask"]
+    mid = 0.5 * (bid + ask)
+
+    filtered_calls_data["midPrice"] = np.where(
+        (bid > 0) & (ask > 0),
+        mid,
+        filtered_calls_data["lastPrice"])
+
 
     return filtered_calls_data.reset_index(drop=True)
 
-def calculate_implied_volatility(filtered_calls_data, spot_price, risk_free_rate, dividend_yield):
-    imp_vol_data = pd.DataFrame(columns=["ContractSymbol", "StrikePrice", "TimeToExpiry", "ImpliedVolatility"])
-    df_index = 0
 
-    for i in range(len(filtered_calls_data)):
-        if f.calculate_time_to_expiration(filtered_calls_data.iloc[i]["expiration"]) > 0:
-            time_to_expiry = f.calculate_time_to_expiration(filtered_calls_data.iloc[i]["expiration"])
-            imp = f.Call_IV(
-                S=spot_price,
-                X=filtered_calls_data.iloc[i]["strike"],
-                r=risk_free_rate,
-                T=time_to_expiry,
-                Call_Price=filtered_calls_data.iloc[i]["lastPrice"],
-                q=dividend_yield  # Assuming no dividend yield here; adjust if needed
-            )
-            imp_vol_data.loc[df_index] = [
-                filtered_calls_data.iloc[i]['contractSymbol'],
-                filtered_calls_data.iloc[i]["strike"],
-                time_to_expiry,
-                imp
-            ]
-            df_index += 1
+def calculate_implied_volatility(filtered_calls_data, spot_price, risk_free_rate, dividend_yield):
+    rows = []
+    for _, row in filtered_calls_data.iterrows():
+        T = row["TimeToExpiry"]
+        price = row["midPrice"]
+
+        if not np.isfinite(price) or price <= 0: continue
+        if not np.isfinite(T) or T <= 0: continue
+        iv = f.Call_IV(spot_price, row["strike"], risk_free_rate, T, price, dividend_yield)
+        if np.isfinite(iv):
+            rows.append((row["contractSymbol"], row["strike"], T, iv))
+
+    imp_vol_data = pd.DataFrame(rows, columns=["ContractSymbol","StrikePrice","TimeToExpiry","ImpliedVolatility"])
+
 
     return imp_vol_data.dropna().reset_index(drop=True)
 
@@ -77,23 +87,22 @@ def get_plot_data(filtered_df):
 
 # Optional: a function to create the plot if needed.
 def plot_implied_volatility(X, Y, Z):
-    # Define grid for interpolation
     xi = np.linspace(X.min(), X.max(), 50)
     yi = np.linspace(Y.min(), Y.max(), 50)
     xi, yi = np.meshgrid(xi, yi)
 
-    # Interpolate Z values over the grid
-    zi = griddata((X, Y), Z, (xi, yi), method='linear')
+    zi = griddata((X, Y), Z, (xi, yi), method="linear")
+    zi2 = griddata((X, Y), Z, (xi, yi), method="nearest")
+    zi = np.where(np.isnan(zi), zi2, zi)
 
-    # Create the 3D plot using Plotly
-    fig = go.Figure(data=[go.Surface(x=xi, y=yi, z=zi, colorscale='Viridis')])
+    fig = go.Figure(data=[go.Surface(x=xi, y=yi, z=zi, colorscale="Viridis")])
     fig.update_layout(
-        title='Implied Volatility Surface',
+        title="Implied Volatility Surface",
         scene=dict(
-            xaxis_title='Time to Expiration (years)',
-            yaxis_title='Strike Price ($)',
-            zaxis_title='Implied Volatility (%)'
-        )
+            xaxis_title="Time to Expiration (years)",
+            yaxis_title="Strike Price ($)",
+            zaxis_title="Implied Volatility (%)",
+        ),
     )
-
     return fig
+

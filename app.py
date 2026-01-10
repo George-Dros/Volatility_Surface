@@ -2,94 +2,102 @@ import streamlit as st
 import main as m
 import numpy as np
 from scipy.interpolate import griddata
+import plotly.graph_objects as go
 
-#Set up Streamlit app
-st.title('Implied Volatility Surface Interactive App')
+st.title("Implied Volatility Surface Interactive App")
+st.sidebar.header("User Inputs")
 
-#Add sidebar inputs
-st.sidebar.header('User Inputs')
-
-#User Inputs
-ticker = st.sidebar.text_input('Ticker', value='SPY')
-risk_free_rate = st.sidebar.number_input('Risk-Free Rate', min_value=0.0, max_value=1.0, value=0.01,  format="%.4f")
-dividend_yield = st.sidebar.number_input('Dividend Yield', min_value=0.0, max_value=1.0, value=0.001,   format="%.4f")
-
-# User choice: Moneyness or Strike Price
-option_type = st.sidebar.selectbox('Select Strike Price or Moneyness', ['Strike Price', 'Moneyness'])
-
-#Retrieve the spot price dynamically to set up the slider range
-stock, spot_prices, spot_price = m.get_stock_data(ticker)
-
-# Set a dynamic percentage range for the slider to cover a broad enough strike price range
-dynamic_min_percentage = 20  # 20% of the spot price
-dynamic_max_percentage = 200  # 200% of the spot price
-
-# Set a default range within the dynamic range
-default_min_percentage = 70  # 70% of the spot price
-default_max_percentage = 130  # 130% of the spot price
-
-# Create the slider for strike price range percentages dynamically
-strike_price_range_percentage = st.sidebar.slider(
-    'Strike Price Range (as % of Spot Price)',
-    min_value=dynamic_min_percentage,  # Minimum percentage allowed
-    max_value=dynamic_max_percentage,  # Maximum percentage allowed
-    value=(default_min_percentage, default_max_percentage)  # Default range
+ticker = st.sidebar.text_input("Ticker", value="SPY")
+risk_free_rate = st.sidebar.number_input(
+    "Risk-Free Rate", min_value=0.0, max_value=1.0, value=0.01, format="%.4f"
+)
+dividend_yield = st.sidebar.number_input(
+    "Dividend Yield", min_value=0.0, max_value=1.0, value=0.001, format="%.4f"
 )
 
-# Convert percentage range to fractions and calculate actual strike prices
-min_percentage = strike_price_range_percentage[0] / 100
-max_percentage = strike_price_range_percentage[1] / 100
-min_strike_price = spot_price * min_percentage
-max_strike_price = spot_price * max_percentage
+option_type = st.sidebar.selectbox(
+    "Select Strike Price or Moneyness", ["Strike Price", "Moneyness"]
+)
 
+# Stock data
+stock, spot_prices, spot_price = m.get_stock_data(ticker)
 
-# Get options data using the ticker specified by the user
+# Options data (fetch ONCE)
 calls_data, expiration_dates = m.get_options_data(stock)
+if calls_data.empty:
+    st.error("No options data returned for this ticker (or Yahoo blocked the request). Try another ticker.")
+    st.stop()
 
-# Filter the calls data using the calculated strike price range
+# Slider
+dynamic_min_percentage = 20
+dynamic_max_percentage = 200
+default_min_percentage = 70
+default_max_percentage = 130
+
+strike_price_range_percentage = st.sidebar.slider(
+    "Strike Price Range (as % of Spot Price)",
+    min_value=dynamic_min_percentage,
+    max_value=dynamic_max_percentage,
+    value=(default_min_percentage, default_max_percentage),
+)
+
+min_strike_price = spot_price * (strike_price_range_percentage[0] / 100)
+max_strike_price = spot_price * (strike_price_range_percentage[1] / 100)
+
+# Filter
 filtered_calls_data = m.filter_calls_data(calls_data, spot_price, min_strike_price, max_strike_price)
+if filtered_calls_data.empty:
+    st.error("No options matched your strike/expiry filters. Widen the strike range or lower the min expiry.")
+    st.stop()
 
-# Calculate implied volatility with user-defined risk-free rate and dividend yield
+# IV
 imp_vol_data = m.calculate_implied_volatility(filtered_calls_data, spot_price, risk_free_rate, dividend_yield)
+if imp_vol_data.empty:
+    st.error("IV computation returned no valid points (bad quotes / illiquid options). Try widening range or another ticker.")
+    st.stop()
 
-#Prepare data for plotting based on user selection
-if option_type == 'Moneyness':
-    # Calculate moneyness as Spot Price / Strike Price
-    imp_vol_data['Moneyness'] = imp_vol_data['StrikePrice'] / spot_price
-    X = imp_vol_data['TimeToExpiry'].values
-    Y = imp_vol_data['Moneyness'].values
+# Prepare plot data
+X = imp_vol_data["TimeToExpiry"].values
+Z = imp_vol_data["ImpliedVolatility"].values * 100
+
+if option_type == "Moneyness":
+    # Forward log-moneyness: ln(K/F), F = S * exp((r-q)T)
+    T = imp_vol_data["TimeToExpiry"].values
+    F = spot_price * np.exp((risk_free_rate - dividend_yield) * T)
+    F = np.maximum(F, 1e-12)  # safety
+
+    imp_vol_data["LogMoneyness"] = np.log(imp_vol_data["StrikePrice"].values / F)
+    Y = imp_vol_data["LogMoneyness"].values
+    y_label = "Log-moneyness ln(K/F)"
 else:
-    # Use Strike Price directly
-    X = imp_vol_data['TimeToExpiry'].values
-    Y = imp_vol_data['StrikePrice'].values
+    Y = imp_vol_data["StrikePrice"].values
+    y_label = "Strike Price ($)"
 
-Z = imp_vol_data['ImpliedVolatility'].values * 100
+# Robustness for interpolation
+if len(np.unique(X)) < 2 or len(np.unique(Y)) < 2:
+    st.error("Not enough variation in expiry/strike to build a surface. Widen strike range or include more expiries.")
+    st.stop()
 
-#Check if data is available for plotting
-if not X.size or not Y.size or not Z.size:
-    st.error("No data available for the selected parameters. Please adjust your inputs.")
-else:
-    # Interpolate data for 3D surface plotting
-    # Create a meshgrid for plotting
-    xi = np.linspace(min(X), max(X), 30)
-    yi = np.linspace(min(Y), max(Y), 30)
-    xi, yi = np.meshgrid(xi, yi)
+# Interpolate
+xi = np.linspace(X.min(), X.max(), 30)
+yi = np.linspace(Y.min(), Y.max(), 30)
+xi, yi = np.meshgrid(xi, yi)
 
-    # Interpolate Z values for the meshgrid
-    zi = griddata((X, Y), Z, (xi, yi), method='linear')
+zi = griddata((X, Y), Z, (xi, yi), method="linear")
+zi2 = griddata((X, Y), Z, (xi, yi), method="nearest")
+zi = np.where(np.isnan(zi), zi2, zi)
 
-    #Plot the data using Plotly
-    import plotly.graph_objects as go
+# Plot
+fig = go.Figure(data=[go.Surface(x=xi, y=yi, z=zi, colorscale="Viridis")])
+fig.update_layout(
+    title=f"Implied Volatility Surface of {ticker}",
+    scene=dict(
+        xaxis_title="Time to Expiration (years)",
+        yaxis_title=y_label,
+        zaxis_title="Implied Volatility (%)",
+    ),
+    width=1000,
+    height=800,
+)
 
-    fig = go.Figure(data=[go.Surface(x=xi, y=yi, z=zi, colorscale='Viridis')])
-    fig.update_layout(
-        title=f'Implied Volatility Surface of {ticker}',
-        scene=dict(
-            xaxis_title='Time to Expiration (years)',
-            yaxis_title='Moneyness' if option_type == 'Moneyness' else 'Strike Price ($)',
-            zaxis_title='Implied Volatility (%)'
-        )
-    )
-
-    fig.update_layout(width=1000, height=800)  # Increase the plot size
-    st.plotly_chart(fig)
+st.plotly_chart(fig)

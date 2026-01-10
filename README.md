@@ -1,69 +1,107 @@
 # Volatility Surface
 
-This project visualizes a 3D implied volatility surface for options on any stock ticker symbol. It allows users to explore how implied volatility varies with strike price, moneyness, and time to expiration. This tool is ideal for analyzing option pricing and understanding volatility behavior.
+An interactive Streamlit app that visualizes a **3D implied volatility surface** for options on a chosen stock ticker.  
+Explore how implied volatility varies across **time to expiration** and either **strike** or **moneyness**.
 
+---
 ## Features
 
-- **Flexible Ticker Symbol**: Enter any stock ticker to analyze its implied volatility surface.
+- **Flexible Ticker Symbol**: Analyze options for any supported ticker (via Yahoo Finance / `yfinance`).
 - **Configurable Inputs**:
-  - **Risk-Free Rate**: Input a custom risk-free rate to reflect current market conditions.
-  - **Dividend Yield**: Automatically fetched from market data or adjustable for scenario testing.
-  - **Strike Price Filter**: Set minimum and maximum strike price filters as a percentage of the spot price.
-  - **Y-Axis Selection**: Choose between strike price or moneyness for the Y-axis on the volatility surface.
+  - **Risk-Free Rate**: User-defined (for scenario testing / current market assumptions).
+  - **Dividend Yield**: User-defined (scenario testing).
+  - **Strike Range Filter**: Choose a strike range as a percentage of spot price.
+  - **Y-Axis Selection**:
+    - **Strike Price**, or
+    - **Log-moneyness**:  \(\ln(K/F)\), where \(F = S \cdot e^{(r-q)T}\)
 - **3D Volatility Surface Plot**:
-  - X-axis: Time to expiration
-  - Y-axis: Strike price or moneyness
-  - Z-axis (color-coded): Implied volatility, providing a heatmap of volatility levels.
+  - X-axis: Time to expiration (years)
+  - Y-axis: Strike price or log-moneyness
+  - Z-axis: Implied volatility (%)
+
+---
 
 ## Visualization
 
-The implied volatility surface is represented as a 3D plot, with higher volatility areas highlighted in warmer colors. This plot allows users to visualize volatility skews and smiles, which are essential for option pricing and risk management.
+Example output from the app:
 
 ![volatility_surface](screenshot/volatility_surface_.jpg "Volatility Surface Example")
 
+---
+
 ## Setup Instructions
 
-1. **Clone the Repository**:
+1) **Clone the Repository**:
    ```bash
-   git clone https://github.com/your-username/volatility-surface.git
-   cd volatility-surface
+    git clone https://github.com/George-Dros/Volatility_Surface
+    cd Volatility_Surface
+    ```
 
-2. Install Required Packages: Make sure you have Python 3 installed. Then, install the required Python packages:
+2) **Create and activate a virtual environment**
    ```bash
-   pip install -r requirements.txt
+   py -3.12 -m venv .venv
+    .\.venv\Scripts\Activate.ps1
+    ```
 
-3. Run the Application: If you're using a Jupyter Notebook, launch the notebook:
-   jupyter notebook
+3) **Install requirements**
+    ```bash
+    pip install -r requirements.txt
+    ```
 
-4. Data Source: The model retrieves option data and market data (spot price, dividend yield, etc.) from financial APIs (e.g., Yahoo Finance). Make sure you have API    access.
+4) **Run the Streamlit app**
+    ```bash
+    streamlit run app.py
+    ```
+
+---
 
 ## How it works
 
 
-1. Data Collection: The application fetches option chain data for the selected ticker, including spot price, strike prices, time to expiration, and current option      prices.
+1. Data Collection: Fetches option chain data (calls), expirations, strikes, and market prices via `yfinance`.
 
-2. Implied Volatility Calculation: Using the Black-Scholes model, the tool calculates implied volatility by iteratively solving for volatility based on the option      market price.
+2. Filtering: Filters options by strike range and removes very short-dated expirations.
 
-3. 3D Plot Generation: The calculated implied volatilities are plotted as a 3D surface with strike price (or moneyness), time to expiry, and implied volatility.
+3. Implied Volatility Calculation: Computes implied volatility by solving for σ in the Black–Scholes model (with dividend yield q) using a root-finder.
+
+4. Surface Construction: Interpolates the IV points onto a grid and plots a 3D surface with Plotly.
+
+---
+
+## Notes / Limitations
+
+- Data quality depends on Yahoo Finance quotes; some tickers/expirations may return sparse or missing data.
+
+- Surfaces can look noisy for illiquid options (wide bid/ask spreads, stale last prices).
+
+- Current implementation focuses on calls.
+
+---
 
 ## Use Cases
 
- 1. Option Pricing and Hedging: Analyze volatility to understand option price behavior under various market conditions.
+ 1. Volatility Smile / Skew Inspection: Visualize skew patterns across maturities and strikes/moneyness.
     
- 2. Market Sentiment Analysis: Use volatility skews to gauge market sentiment and the perceived risk of price movements.
+ 2. Scenario Testing: Change r and q to see how assumptions affect the surface.
     
- 3. Scenario Testing: Adjust dividend yield and risk-free rate inputs to test how changes impact the volatility surface.
+ 3. Learning Tool: A quick way to connect option market prices to implied vol behavior.
+
+---
 
 ## Future Enhancements
 
-  1. Integrate additional option pricing models (e.g., binomial tree) for non-European options.
-     
-  2. Allow users to save and export the generated volatility surface.
-     
-  3. Implement real-time data streaming for live updates.
+- Add puts and put/call parity checks.
+
+- Liquidity filters (volume/open interest/spread) as UI controls.
+
+- Surface export (CSV + image).
+
+- Alternative smoothing/interpolation methods or model fits (e.g., SVI).
+
+---
 
 ## License
 
   This project is open-source and available under the MIT License.
 
-  Created by GeorgeDros
+  Created by Georgios Drosogiannis
