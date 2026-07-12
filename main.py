@@ -1,108 +1,182 @@
 # main.py
-import yfinance as yf
-import pandas as pd
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+
 import numpy as np
-import functions as f
+import pandas as pd
 import streamlit as st
-from scipy.interpolate import griddata
-import plotly.graph_objects as go
+import yfinance as yf
+
+import functions as f
+
+# Columns produced by the implied-volatility step (kept as a constant so an
+# empty result still has the right schema for downstream code).
+IV_COLUMNS = [
+    "ContractSymbol", "StrikePrice", "TimeToExpiry", "ImpliedVolatility",
+    "OptionType", "Expiration", "Volume", "OpenInterest", "SpreadPct",
+]
 
 
-def get_stock_data(ticker_symbol="SPY", period="1y"):
-    stock = yf.Ticker(ticker_symbol)
-    spot_prices = stock.history(period=period)["Close"].to_frame()
+@st.cache_data(show_spinner="Fetching spot price…", ttl=900)
+def get_stock_data(ticker_symbol="SPY", period="5d"):
+    """Fetch recent price history and derive the spot price.
 
-    # Attempt to get today's spot price safely
-    spot_data = stock.history(period="1d")["Close"]
+    Cached per (ticker, period) for 15 min. A single ``history`` call covers
+    both needs, so the old duplicate 1d request is gone. Raises ValueError on
+    an unknown / empty ticker so callers can show a friendly message.
+    """
+    hist = yf.Ticker(ticker_symbol).history(period=period)
+    if hist.empty or "Close" not in hist or hist["Close"].dropna().empty:
+        raise ValueError(
+            f"No price data available for '{ticker_symbol}'. "
+            "Check the ticker symbol or try again later."
+        )
 
-    if not spot_data.empty:
-        spot_price = spot_data.iloc[-1]
-    else:
-        st.warning(f"No recent data available for ticker {ticker_symbol}. Defaulting to last available price from historical data.")
-        spot_price = spot_prices.iloc[-1, 0] if not spot_prices.empty else None
-
-    if spot_price is None:
-        raise ValueError(f"No data available for ticker {ticker_symbol}. Please check the ticker symbol or try again later.")
-    
-    return stock, spot_prices, spot_price
+    spot_prices = hist["Close"].dropna().to_frame()
+    spot_price = float(spot_prices["Close"].iloc[-1])
+    return spot_prices, spot_price
 
 
-def get_options_data(stock):
-    calls_frames = []
-    for date in stock.options:
+@st.cache_data(show_spinner="Fetching option chains…", ttl=900)
+def get_options_data(ticker_symbol):
+    """Download every call AND put option chain for a ticker, in parallel.
+
+    Keyed by the ticker *string* (hashable) so the whole result is cached.
+    Returns a single long DataFrame tagged with an ``optionType`` column
+    ('C'/'P') plus the tuple of expiration dates. Chains are fetched
+    concurrently, which cuts wall-clock time roughly in proportion to the
+    worker count.
+    """
+    expirations = tuple(yf.Ticker(ticker_symbol).options)
+    if not expirations:
+        return pd.DataFrame(), expirations
+
+    def fetch(date):
         try:
-            chain = stock.option_chain(date).calls.copy()
-            chain["expiration"] = date
-            calls_frames.append(chain)
+            # Fresh Ticker per thread avoids sharing a non-thread-safe session.
+            chain = yf.Ticker(ticker_symbol).option_chain(date)
+            calls = chain.calls.copy()
+            calls["optionType"] = "C"
+            puts = chain.puts.copy()
+            puts["optionType"] = "P"
+            both = pd.concat([calls, puts], ignore_index=True)
+            both["expiration"] = date
+            return both
         except Exception:
-            continue
+            return None
 
-    calls_all = pd.concat(calls_frames, ignore_index=True) if calls_frames else pd.DataFrame()
-    return calls_all, stock.options
+    max_workers = min(8, len(expirations))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        frames = [c for c in executor.map(fetch, expirations)
+                  if c is not None and not c.empty]
 
-def filter_calls_data(calls_data, spot_price, min_strike_price, max_strike_price):
-    filtered_calls_data = calls_data[
-        (calls_data["strike"] >= min_strike_price) &
-        (calls_data["strike"] <= max_strike_price)].copy()
+    options_all = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    return options_all, expirations
 
-    filtered_calls_data["TimeToExpiry"] = filtered_calls_data["expiration"].map(f.calculate_time_to_expiration)
-    filtered_calls_data = filtered_calls_data[filtered_calls_data["TimeToExpiry"] >= 0.07]
 
-    bid = filtered_calls_data["bid"]
-    ask = filtered_calls_data["ask"]
+@st.cache_data(show_spinner=False)
+def prepare_options(options_data, spot_price, min_time_to_expiry=0.07):
+    """Blend to the out-of-the-money side, add TimeToExpiry / midPrice / liquidity.
+
+    A real vol surface is built from OTM options on each side (OTM puts below
+    spot, OTM calls above), because those are the liquid, informative quotes --
+    ITM options carry wide spreads and stale last prices. For each strike we
+    therefore keep the put when strike <= spot and the call when strike > spot,
+    leaving exactly one contract per (expiration, strike).
+
+    Strike-independent, so it runs once on the full chain (not per slider move).
+    TimeToExpiry uses a single ``now`` mapped over unique dates -- deterministic
+    and cheap. Liquidity columns are carried through so the app can filter them
+    in memory without recomputing IV.
+    """
+    if options_data.empty:
+        return options_data
+
+    df = options_data.copy()
+
+    now = datetime.now()
+    tte_by_date = {
+        date: f.calculate_time_to_expiration(date, now=now)
+        for date in df["expiration"].unique()
+    }
+    df["TimeToExpiry"] = df["expiration"].map(tte_by_date)
+    df = df[df["TimeToExpiry"] >= min_time_to_expiry].copy()
+
+    # OTM blend: puts at/below spot, calls above spot.
+    is_otm = np.where(df["optionType"].values == "P",
+                      df["strike"].values <= spot_price,
+                      df["strike"].values > spot_price)
+    df = df[is_otm].copy()
+
+    bid = df["bid"]
+    ask = df["ask"]
     mid = 0.5 * (bid + ask)
+    quoted = (bid > 0) & (ask > 0)
+    # Use the bid/ask midpoint when both sides are quoted, else last traded price.
+    df["midPrice"] = np.where(quoted, mid, df["lastPrice"])
+    # Relative spread in %, only meaningful when both sides are quoted.
+    df["SpreadPct"] = np.where(quoted & (mid > 0), 100.0 * (ask - bid) / mid, np.nan)
+    df["Volume"] = df.get("volume", pd.Series(index=df.index, dtype=float)).fillna(0)
+    df["OpenInterest"] = df.get("openInterest", pd.Series(index=df.index, dtype=float)).fillna(0)
 
-    filtered_calls_data["midPrice"] = np.where(
-        (bid > 0) & (ask > 0),
-        mid,
-        filtered_calls_data["lastPrice"])
+    return df.reset_index(drop=True)
 
 
-    return filtered_calls_data.reset_index(drop=True)
+@st.cache_data(show_spinner="Computing implied volatilities…")
+def calculate_implied_volatility(prepared_options, spot_price, risk_free_rate, dividend_yield):
+    """Solve Black-Scholes implied vol for every OTM option in the chain.
 
+    Uses the put inverter for puts and the call inverter for calls. Depends only
+    on (chain, spot, r, q) -- NOT on the strike / liquidity sliders -- so it is
+    computed once per parameter set and cached; the app then filters the result
+    in memory.
+    """
+    if prepared_options.empty:
+        return pd.DataFrame(columns=IV_COLUMNS)
 
-def calculate_implied_volatility(filtered_calls_data, spot_price, risk_free_rate, dividend_yield):
+    S = float(spot_price)
+    symbols = prepared_options["contractSymbol"].to_numpy()
+    strikes = prepared_options["strike"].to_numpy(dtype=float)
+    times = prepared_options["TimeToExpiry"].to_numpy(dtype=float)
+    prices = prepared_options["midPrice"].to_numpy(dtype=float)
+    kinds = prepared_options["optionType"].to_numpy()
+    expirations = prepared_options["expiration"].to_numpy()
+    volumes = prepared_options["Volume"].to_numpy(dtype=float)
+    ois = prepared_options["OpenInterest"].to_numpy(dtype=float)
+    spreads = prepared_options["SpreadPct"].to_numpy(dtype=float)
+
     rows = []
-    for _, row in filtered_calls_data.iterrows():
-        T = row["TimeToExpiry"]
-        price = row["midPrice"]
-
-        if not np.isfinite(price) or price <= 0: continue
-        if not np.isfinite(T) or T <= 0: continue
-        iv = f.Call_IV(spot_price, row["strike"], risk_free_rate, T, price, dividend_yield)
+    for sym, strike, T, price, kind, exp, vol, oi, spr in zip(
+        symbols, strikes, times, prices, kinds, expirations, volumes, ois, spreads
+    ):
+        if not (np.isfinite(price) and price > 0):
+            continue
+        if not (np.isfinite(T) and T > 0):
+            continue
+        iv = f.Calculate_IV_Call_Put(S, strike, risk_free_rate, T, price, kind, dividend_yield)
         if np.isfinite(iv):
-            rows.append((row["contractSymbol"], row["strike"], T, iv))
+            rows.append((sym, strike, T, iv, kind, exp, vol, oi, spr))
 
-    imp_vol_data = pd.DataFrame(rows, columns=["ContractSymbol","StrikePrice","TimeToExpiry","ImpliedVolatility"])
+    return pd.DataFrame(rows, columns=IV_COLUMNS)
 
 
-    return imp_vol_data.dropna().reset_index(drop=True)
+def filter_iv_data(iv_data, min_strike_price, max_strike_price,
+                   min_volume=0, min_open_interest=0, max_spread_pct=None):
+    """Filter an IV table by strike window and liquidity (cheap, in-memory).
 
-def get_plot_data(filtered_df):
-    X = filtered_df['TimeToExpiry'].values
-    Y = filtered_df['StrikePrice'].values
-    Z = filtered_df['ImpliedVolatility'].values * 100
+    Rows whose spread is unknown (last-price-only quotes) are kept regardless of
+    ``max_spread_pct`` -- we simply can't assess their spread.
+    """
+    if iv_data.empty:
+        return iv_data
 
-    return X, Y, Z
-
-# Optional: a function to create the plot if needed.
-def plot_implied_volatility(X, Y, Z):
-    xi = np.linspace(X.min(), X.max(), 50)
-    yi = np.linspace(Y.min(), Y.max(), 50)
-    xi, yi = np.meshgrid(xi, yi)
-
-    zi = griddata((X, Y), Z, (xi, yi), method="linear")
-    zi2 = griddata((X, Y), Z, (xi, yi), method="nearest")
-    zi = np.where(np.isnan(zi), zi2, zi)
-
-    fig = go.Figure(data=[go.Surface(x=xi, y=yi, z=zi, colorscale="Viridis")])
-    fig.update_layout(
-        title="Implied Volatility Surface",
-        scene=dict(
-            xaxis_title="Time to Expiration (years)",
-            yaxis_title="Strike Price ($)",
-            zaxis_title="Implied Volatility (%)",
-        ),
+    mask = (
+        (iv_data["StrikePrice"] >= min_strike_price)
+        & (iv_data["StrikePrice"] <= max_strike_price)
+        & (iv_data["Volume"] >= min_volume)
+        & (iv_data["OpenInterest"] >= min_open_interest)
     )
-    return fig
+    if max_spread_pct is not None:
+        mask &= iv_data["SpreadPct"].isna() | (iv_data["SpreadPct"] <= max_spread_pct)
 
+    return iv_data[mask].reset_index(drop=True)

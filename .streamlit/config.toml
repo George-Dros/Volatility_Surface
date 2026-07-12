@@ -1,5 +1,6 @@
 [server]
 headless = true
-enableCORS = false
+# XSRF protection is on; Streamlit ignores (and warns about) enableCORS=false
+# while it's enabled, so we leave CORS at its default.
 enableXsrfProtection = true
 

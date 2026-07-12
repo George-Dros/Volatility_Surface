@@ -125,24 +125,29 @@ def Calculate_IV_Call_Put(S, X, r, T, Option_Price, Put_or_Call, q):
         return np.nan
 
 
-def calculate_time_to_expiration(expiration_date_str: str) -> float:
+def calculate_time_to_expiration(expiration_date_str: str, now: datetime = None) -> float:
     """
-    Calculate the time to expiration in years from today.
+    Calculate the time to expiration in years from a reference instant.
 
     Parameters:
     expiration_date_str (str): Expiration date in the format 'YYYY-MM-DD'
+    now (datetime): Reference instant. Pass a single value when mapping over
+        many rows so every row shares the same "now" -- otherwise datetime.now()
+        is re-sampled per call and drifts, giving rows on the SAME expiration
+        date slightly different times-to-expiry.
 
     Returns:
-    float: Time to expiration in years
+    float: Time to expiration in years (never negative)
     """
     # Parse the expiration date string to a datetime object
     expiration_date = datetime.strptime(expiration_date_str, "%Y-%m-%d")
 
-    # Get today's date
-    current_date = datetime.now()
+    # Reference instant (sampled once by the caller for consistency)
+    if now is None:
+        now = datetime.now()
 
     # Calculate the number of days to expiration
-    dt = expiration_date - current_date
+    dt = expiration_date - now
 
     # Convert seconds to years (use 365 for simplicity)
     T = dt.total_seconds() / (365.0 * 24 * 3600)
